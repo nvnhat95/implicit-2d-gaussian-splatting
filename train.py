@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr, render_net_image
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from gaussian_revision_mlp import GaussianRevisionPipeline, apply_gaussian_deltas
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -37,6 +38,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # Initialize Gaussian revision pipeline
+    checkpoint_path = "octformer/checkpoints/octformer_scannet200/best_model.pth"
+    revision_pipeline = None
+    batch_size = 1024
+
+    if os.path.exists(checkpoint_path):
+        try:
+            revision_pipeline = GaussianRevisionPipeline(
+                checkpoint_path=checkpoint_path,
+                max_sh_degree=dataset.sh_degree,
+                octree_depth=8,
+                position_encoding='both',
+                feature_depth=5,  # Use features from depth 8
+                device='cuda',
+                batch_size=batch_size,
+            )
+            
+            # Add MLP parameters to optimizer
+            mlp_params = list(revision_pipeline.mlp.parameters())
+            if mlp_params:
+                mlp_optimizer = torch.optim.Adam(mlp_params, lr=opt.feature_lr)
+                print("Initialized MLP optimizer for Gaussian revision")
+            else:
+                mlp_optimizer = None
+        except Exception as e:
+            print(f"Failed to initialize revision pipeline: {e}")
+            revision_pipeline = None
+            mlp_optimizer = None
+    else:
+        print(f"Checkpoint not found: {checkpoint_path}")
+        revision_pipeline = None
+        mlp_optimizer = None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -66,6 +100,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
+        alpha = 0.5
+
+        # Revise Gaussians using Octree
+        # first we convert Gaussians to NDFP format
+        # then we use the octformer backbone to extract features + relative positions for each Gaussian
+        # then we concat the features and relative positions to get the final features
+        # next, we pass the final features to an MLP to get the final revised delta Gaussians
+        # then, Gaussians will be added with delta Gaussians to get the final revised Gaussians
+        #    gaussians = (1 - alpha) * gaussians + alpha * delta_gaussians
+        # the MLP will be learned by the loss below
+        if revision_pipeline is not None and iteration > 100:  # Start revision after some initial training
+            try:
+                # Set MLP to training mode
+                revision_pipeline.mlp.train()
+                
+                # Get delta Gaussians from the revision pipeline
+                deltas = revision_pipeline(gaussians, batch_size=batch_size)
+                
+                # Apply deltas to gaussians with alpha blending
+                apply_gaussian_deltas(gaussians, deltas, alpha, training=True)
+                
+            except Exception as e:
+                print(f"Error in Gaussian revision at iteration {iteration}: {e}")
+                import traceback
+                traceback.print_exc()
+                import sys; sys.exit(1)
+                # Continue without revision if there's an error
+
+
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
@@ -83,7 +146,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
-
+        
         # loss
         total_loss = loss + dist_loss + normal_loss
         
@@ -138,6 +201,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                
+                # Step MLP optimizer if revision pipeline is active
+                if mlp_optimizer is not None and revision_pipeline is not None and iteration > 1000:
+                    mlp_optimizer.step()
+                    mlp_optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
