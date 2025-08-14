@@ -92,6 +92,14 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
+        # print statistics of each parameter
+        print("xyz statistics", torch.mean(torch.abs(self._xyz.data)), torch.std(self._xyz.data), torch.min(self._xyz.data), torch.max(self._xyz.data))
+        print("features_dc statistics", torch.mean(torch.abs(self._features_dc.data)), torch.std(self._features_dc.data), torch.min(self._features_dc.data), torch.max(self._features_dc.data))
+        print("features_rest statistics", torch.mean(torch.abs(self._features_rest.data)), torch.std(self._features_rest.data), torch.min(self._features_rest.data), torch.max(self._features_rest.data))
+        print("scaling statistics", torch.mean(torch.abs(self._scaling.data)), torch.std(self._scaling.data), torch.min(self._scaling.data), torch.max(self._scaling.data))
+        print("rotation statistics", torch.mean(torch.abs(self._rotation.data)), torch.std(self._rotation.data), torch.min(self._rotation.data), torch.max(self._rotation.data))
+        print("opacity statistics", torch.mean(torch.abs(self._opacity.data)), torch.std(self._opacity.data), torch.min(self._opacity.data), torch.max(self._opacity.data))
+
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling) #.clamp(max=1)

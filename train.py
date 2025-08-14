@@ -46,7 +46,9 @@ def get_annealed_alpha(iteration, start_iter, start_alpha, end_alpha, annealing_
         return start_alpha
     
     progress = min((iteration - start_iter) / annealing_iters, 1.0)
-    return start_alpha + progress * (end_alpha - start_alpha)
+    alpha = start_alpha + progress * (end_alpha - start_alpha)
+    
+    return alpha
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
     first_iter = 0
@@ -61,10 +63,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # Initialize Gaussian revision pipeline
     revision_pipeline = None
     mlp_optimizer = None
+    base_gaussians = None
     
     if opt.revision:
         checkpoint_path = "octformer/checkpoints/octformer_scannet200/best_model.pth"
-        batch_size = 1024
+        batch_size = 8192
 
         if os.path.exists(checkpoint_path):
             try:
@@ -73,7 +76,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     max_sh_degree=dataset.sh_degree,
                     octree_depth=8,
                     position_encoding='both',
-                    feature_depth=5,  # Use features from depth 5
+                    feature_depth=6,  # Use features from depth 5
                     device='cuda',
                     batch_size=batch_size,
                 )
@@ -83,10 +86,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if mlp_params:
                     mlp_optimizer = torch.optim.Adam(mlp_params, lr=opt.feature_lr)
                     print("Initialized MLP optimizer for Gaussian revision")
+                    print(f"MLP has {len(mlp_params)} parameter groups with total {sum(p.numel() for p in mlp_params)} parameters")
+                    print(f"MLP learning rate: {opt.feature_lr}")
                 else:
                     mlp_optimizer = None
                     
                 print(f"Revision pipeline enabled with alpha annealing: {opt.revision_alpha_start} -> {opt.revision_alpha_end} over {opt.revision_alpha_annealing_iters} iterations")
+                print(f"Alpha annealing will start at iteration {opt.revision_start_iter}")
             except Exception as e:
                 print(f"Failed to initialize revision pipeline: {e}")
                 revision_pipeline = None
@@ -115,10 +121,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
+        gaussians.update_learning_rate(iteration - first_iter)
 
+        # Determine if revision will be active for this iteration
+        revision_active = revision_pipeline is not None and iteration >= opt.revision_start_iter
+        
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
+        # Skip during revision phase to keep original gaussians unchanged
+        if iteration % 1000 == 0 and not revision_active:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -134,11 +144,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # then, Gaussians will be added with delta Gaussians to get the final revised Gaussians
         #    gaussians = (1 - alpha) * gaussians + alpha * delta_gaussians
         # the MLP will be learned by the loss below
-        if revision_pipeline is not None and iteration >= opt.revision_start_iter:
+        # NOTE: Only MLP is updated, base_gaussians remain unchanged
+        current_gaussians = gaussians  # Default to original gaussians
+        
+        if revision_active:
             try:
                 # Calculate annealed alpha value
                 alpha = get_annealed_alpha(
-                    iteration, 
+                    iteration - first_iter, 
                     opt.revision_start_iter, 
                     opt.revision_alpha_start, 
                     opt.revision_alpha_end, 
@@ -148,11 +161,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Set MLP to training mode
                 revision_pipeline.mlp.train()
                 
-                # Get delta Gaussians from the revision pipeline
+                # Get delta Gaussians from the revision pipeline using base_gaussians
                 deltas = revision_pipeline(gaussians, batch_size=batch_size)
                 
-                # Apply deltas to gaussians with alpha blending
-                apply_gaussian_deltas(gaussians, deltas, alpha, training=True)
+                # Apply deltas to create a modified copy for rendering
+                current_gaussians = apply_gaussian_deltas(gaussians, deltas, alpha, training=True)
+                
+                revision_active = True
                 
             except Exception as e:
                 print(f"Error in Gaussian revision at iteration {iteration}: {e}")
@@ -162,7 +177,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Continue without revision if there's an error
 
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+        render_pkg = render(viewpoint_cam, current_gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
@@ -212,14 +227,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
 
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), current_gaussians)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            # Skip densification during revision phase to keep original gaussians unchanged
+            if iteration < opt.densify_until_iter and not revision_active:
+                # Update densification stats on base gaussians using render results from current_gaussians
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
@@ -232,11 +249,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
+                # Only update gaussians if revision is not active
+                # When revision is active, only MLP should be updated
+                if not revision_active:
+                    gaussians.optimizer.step()
+                    gaussians.optimizer.zero_grad(set_to_none = True)
+                else:
+                    # Clear gradients without stepping when revision is active
+                    gaussians.optimizer.zero_grad(set_to_none = True)
                 
                 # Step MLP optimizer if revision pipeline is active
-                if mlp_optimizer is not None and revision_pipeline is not None and iteration > 1000:
+                if mlp_optimizer is not None and revision_pipeline is not None:
                     mlp_optimizer.step()
                     mlp_optimizer.zero_grad(set_to_none = True)
 
@@ -252,7 +275,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     net_image_bytes = None
                     custom_cam, do_training, keep_alive, scaling_modifer, render_mode = network_gui.receive()
                     if custom_cam != None:
-                        render_pkg = render(custom_cam, gaussians, pipe, background, scaling_modifer)   
+                        render_pkg = render(custom_cam, current_gaussians, pipe, background, scaling_modifer)   
                         net_image = render_net_image(render_pkg, dataset.render_items, render_mode, custom_cam)
                         net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                     metrics_dict = {
@@ -291,7 +314,7 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 @torch.no_grad()
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, current_gaussians):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/reg_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -309,7 +332,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
+                    render_pkg = renderFunc(viewpoint, current_gaussians, *renderArgs)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0).to("cuda")
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
@@ -368,6 +391,8 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
+
+    args.test_iterations += [30000 + i for i in range(0, 10000, 100)]
 
     # Initialize system state (RNG)
     safe_state(args.quiet)

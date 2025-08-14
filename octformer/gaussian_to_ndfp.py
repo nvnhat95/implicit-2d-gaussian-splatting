@@ -3,15 +3,16 @@ from typing import Optional
 
 
 def build_rotation(q: torch.Tensor) -> torch.Tensor:
-	"""Convert batched quaternions [x, y, z, w] to rotation matrices (N, 3, 3).
+	"""Convert batched quaternions [w, x, y, z] to rotation matrices (N, 3, 3).
 	Ensures normalization and preserves dtype/device.
+	Compatible with GaussianModel convention.
 	"""
 	if q.dim() != 2 or q.shape[-1] != 4:
 		raise ValueError("build_rotation expects shape (N, 4) quaternion input")
 	# Normalize quaternion
 	eps = torch.finfo(q.dtype).eps if q.is_floating_point() else 1e-8
 	norm = torch.linalg.norm(q, dim=-1, keepdim=True).clamp_min(eps)
-	qx, qy, qz, qw = (q / norm).unbind(-1)
+	qw, qx, qy, qz = (q / norm).unbind(-1)
 
 	xx = qx * qx
 	yy = qy * qy
@@ -48,7 +49,7 @@ class GaussianToNDFP:
 
 	- Normal: computed from Gaussian rotation by rotating the canonical z-axis.
 	- Displacement: constant or provided tensor (default 0.0).
-	- Color: taken from DC SH coefficients using sigmoid.
+	- Color: taken from DC SH coefficients using SH constant and clamping to [0,1].
 	- Position: Gaussian xyz.
 	"""
 
@@ -86,11 +87,11 @@ class GaussianToNDFP:
 		"""Convert from a GaussianModel instance to an NDFP tensor of shape (N, 10).
 		The model is expected to provide:
 		  - model.get_xyz -> (N, 3)
-		  - model._rotation -> (N, 4) quaternion compatible with build_rotation
+		  - model.get_rotation -> (N, 4) normalized quaternion compatible with build_rotation
 		  - model._features_dc -> (N, 1, 3) DC SH per RGB channel
 		"""
 		xyz = model.get_xyz  # (N, 3)
-		rotation_q = model._rotation  # (N, 4)
+		rotation_q = model.get_rotation  # (N, 4) - normalized quaternions
 		features_dc = model._features_dc  # (N, 1, 3)
 
 		# Ensure device consistency
@@ -102,8 +103,13 @@ class GaussianToNDFP:
 		rotation_matrix = build_rotation(rotation_q)  # (N, 3, 3)
 		normals = self._rotation_to_normal(rotation_matrix)  # (N, 3)
 
-		# Color from DC SH via sigmoid
-		dc = features_dc.squeeze(1)  # (N, 3)
+		# Color from DC SH coefficients  
+		if features_dc.dim() == 3 and features_dc.shape[1] == 1:
+			dc = features_dc.squeeze(1)  # (N, 3)
+		elif features_dc.dim() == 2:
+			dc = features_dc  # Already (N, 3)
+		else:
+			raise ValueError(f"Unexpected features_dc shape: {features_dc.shape}, expected (N, 1, 3) or (N, 3)")
 		rgb = self._dc_sh_to_rgb(dc)  # (N, 3)
 
 		# Displacement
@@ -125,7 +131,7 @@ class GaussianToNDFP:
 
 		Args:
 			xyz: (N, 3)
-			rotation: (N, 4) quaternion compatible with build_rotation, or (N, 3, 3) rotation matrices
+			rotation: (N, 4) quaternion [w, x, y, z] compatible with build_rotation, or (N, 3, 3) rotation matrices
 			dc_sh_features: (N, 3) DC SH coefficients for RGB channels; used if rgb is None
 			rgb: (N, 3) direct RGB colors in [0, 1]; overrides dc_sh_features if provided
 			displacement: (N, 1) per-point displacement; if None, uses constant value from init

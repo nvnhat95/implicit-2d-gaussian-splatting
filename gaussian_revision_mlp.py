@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
 import os
 import sys
+import copy
 
 # Add octformer to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'octformer'))
@@ -126,6 +127,10 @@ class GaussianRevisionPipeline(nn.Module):
     3. Concatenates results to produce the same output as non-batched processing
     4. Includes automatic memory cleanup between batches
     
+    The pipeline also includes octree caching for efficiency:
+    - Octree is built once and cached for subsequent calls
+    - Manual cache clearing available when needed
+    
     Usage:
         # Default batch size (8192) - good for most GPUs
         pipeline = GaussianRevisionPipeline(checkpoint_path)
@@ -145,6 +150,10 @@ class GaussianRevisionPipeline(nn.Module):
         
         # Override batch size per call
         deltas = pipeline(gaussians, batch_size=2048)
+        
+        # Force octree rebuild (useful after significant Gaussian changes)
+        pipeline.clear_octree_cache()
+        deltas = pipeline(gaussians)
     """
     
     def __init__(self,
@@ -190,6 +199,9 @@ class GaussianRevisionPipeline(nn.Module):
         
         # Move the entire pipeline to the specified device
         self.to(device)
+        
+        # Initialize octree caching
+        self.cached_octree = None
         
         print(f"Initialized GaussianRevisionPipeline with input_dim={input_dim}, batch_size={batch_size}")
     
@@ -338,6 +350,23 @@ class GaussianRevisionPipeline(nn.Module):
             
         # Move result back to original device
         return closest_voxels.to(point_positions.device)
+    
+    def build_octree(self, ndfp_points: torch.Tensor, force_rebuild: bool = False):
+        """Build octree for the given NDFP points and cache it.
+        
+        Args:
+            ndfp_points: Tensor (N, 10) in NDFP format
+            force_rebuild: If True, rebuild even if cached octree exists
+        """
+        # Build octree if not cached or force rebuild
+        if self.cached_octree is None or force_rebuild:
+            print(f"Building octree for {ndfp_points.shape[0]} points...")
+            self.cached_octree = self.feature_extractor.build_octree(ndfp_points, self.octree_depth)
+    
+    def clear_octree_cache(self):
+        """Clear the cached octree and force rebuild on next use."""
+        self.cached_octree = None
+        print("Cleared octree cache")
 
     def _aggregate_features(self, 
                           voxel_features: Dict[int, torch.Tensor],
@@ -420,7 +449,7 @@ class GaussianRevisionPipeline(nn.Module):
         """
         n_points = combined_features.shape[0]
         n_batches = (n_points + batch_size - 1) // batch_size
-        all_deltas = {}
+        batch_results = []
         
         # Process in batches
         for batch_idx, start_idx in enumerate(range(0, n_points, batch_size)):
@@ -429,24 +458,16 @@ class GaussianRevisionPipeline(nn.Module):
             
             # Process this batch through MLP
             batch_deltas = self._forward_single_batch(batch_features)
-            
-            # Initialize output tensors on first batch
-            if start_idx == 0:
-                for key, value in batch_deltas.items():
-                    all_deltas[key] = torch.empty(
-                        (n_points, value.shape[1]), 
-                        dtype=value.dtype, 
-                        device=value.device
-                    )
-            
-            # Store batch results
-            for key, value in batch_deltas.items():
-                all_deltas[key][start_idx:end_idx] = value
+            batch_results.append(batch_deltas)
             
             # Clear intermediate tensors to free memory
-            del batch_deltas
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        
+        # Concatenate all batch results to preserve gradients
+        all_deltas = {}
+        for key in batch_results[0].keys():
+            all_deltas[key] = torch.cat([batch[key] for batch in batch_results], dim=0)
         
         return all_deltas
 
@@ -463,8 +484,9 @@ class GaussianRevisionPipeline(nn.Module):
         # Convert to NDFP format
         ndfp_points = self.ndfp_converter.convert_from_model(gaussians)
         
-        # Build octree once with all points
-        octree = self.feature_extractor.build_octree(ndfp_points, self.octree_depth)
+        # Build octree if needed (cached for efficiency)
+        self.build_octree(ndfp_points)
+        octree = self.cached_octree
         
         # Extract features once for all points
         if self.training:
@@ -509,43 +531,62 @@ class GaussianRevisionPipeline(nn.Module):
         return self._forward_batched(combined_features, effective_batch_size)
 
 
-def apply_gaussian_deltas(gaussians, deltas: Dict[str, torch.Tensor], alpha: float = 0.5, training: bool = True):
-    """Apply delta parameters to gaussians with blending factor alpha.
+def apply_gaussian_deltas(
+    base_gaussians,
+    deltas: Dict[str, torch.Tensor], 
+    alpha: float = 0.5, 
+    training: bool = True
+) -> 'GaussianModel':
+    """Apply delta parameters to base gaussians and return a modified copy.
     
     Args:
-        gaussians: GaussianModel instance
+        base_gaussians: Original unmodified GaussianModel instance
         deltas: Dict containing delta parameters
         alpha: Blending factor (0 = no change, 1 = full delta)
         training: Whether we're in training mode (affects gradient handling)
+        
+    Returns:
+        Modified copy of the gaussians with deltas applied
     """
+    # Create a copy of base gaussians for modification
+    modified_gaussians = copy.deepcopy(base_gaussians)
+    
     if training:
-        # During training, modify the parameters while preserving gradients
+        # Apply deltas with gradient flow for MLP learning
+        # Compute terms separately for debugging
+
+        # print("XYZ compared", (1 - alpha) * torch.mean(torch.abs(base_gaussians._xyz)), alpha * torch.mean(torch.abs(deltas['xyz'])))
+        # print("features_dc compared", (1 - alpha) * torch.mean(torch.abs(base_gaussians._features_dc)), alpha * torch.mean(torch.abs(deltas['features_dc'])))
+        # print("features_rest compared", (1 - alpha) * torch.mean(torch.abs(base_gaussians._features_rest)), alpha * torch.mean(torch.abs(deltas['features_rest'])))
+        # print("scaling compared", (1 - alpha) * torch.mean(torch.abs(base_gaussians._scaling)), alpha * torch.mean(torch.abs(deltas['scaling'])))
+        # print("rotation compared", (1 - alpha) * torch.mean(torch.abs(base_gaussians._rotation)), alpha * torch.mean(torch.abs(deltas['rotation'])))
+        # print("opacity compared", (1 - alpha) * torch.mean(torch.abs(base_gaussians._opacity)), alpha * torch.mean(torch.abs(deltas['opacity'])))
         
-        # XYZ - in-place operations preserve gradients
-        gaussians._xyz.data.add_(deltas['xyz'], alpha=alpha)
-        
+        # XYZ - blend base with deltas
+        modified_gaussians._xyz = (1 - alpha) * base_gaussians._xyz + alpha * deltas['xyz']
+
         # Features DC - need to handle the shape (N, 1, 3)
         delta_dc = deltas['features_dc'].unsqueeze(1)  # (N, 1, 3)
-        gaussians._features_dc.data.add_(delta_dc, alpha=alpha)
+        modified_gaussians._features_dc = (1 - alpha) * base_gaussians._features_dc + alpha * delta_dc
         
         # Features Rest - need to reshape properly
-        if gaussians._features_rest.numel() > 0:
-            n_points = gaussians._features_rest.shape[0]
-            n_features = gaussians._features_rest.shape[1] 
-            n_coeffs = gaussians._features_rest.shape[2]
+        if base_gaussians._features_rest.numel() > 0:
+            n_points = base_gaussians._features_rest.shape[0]
+            n_features = base_gaussians._features_rest.shape[1] 
+            n_coeffs = base_gaussians._features_rest.shape[2]
             
             # Reshape delta to match features_rest shape
             delta_rest = deltas['features_rest'].view(n_points, n_features, n_coeffs)
-            gaussians._features_rest.data.add_(delta_rest, alpha=alpha)
+            modified_gaussians._features_rest = (1 - alpha) * base_gaussians._features_rest + alpha * delta_rest
         
         # Scaling
-        gaussians._scaling.data.add_(deltas['scaling'], alpha=alpha)
+        modified_gaussians._scaling = (1 - alpha) * base_gaussians._scaling + alpha * deltas['scaling']
         
         # Rotation
-        gaussians._rotation.data.add_(deltas['rotation'], alpha=alpha)
+        modified_gaussians._rotation = (1 - alpha) * base_gaussians._rotation + alpha * deltas['rotation']
         
         # Opacity  
-        gaussians._opacity.data.add_(deltas['opacity'], alpha=alpha)
+        modified_gaussians._opacity = (1 - alpha) * base_gaussians._opacity + alpha * deltas['opacity']
         
     else:
         # During inference, use no_grad for efficiency
@@ -553,27 +594,29 @@ def apply_gaussian_deltas(gaussians, deltas: Dict[str, torch.Tensor], alpha: flo
             # Apply deltas to each parameter
             
             # XYZ
-            gaussians._xyz.data = gaussians._xyz.data + alpha * deltas['xyz']
+            modified_gaussians._xyz.data = (1 - alpha) * base_gaussians._xyz.data + alpha * deltas['xyz']
             
             # Features DC - need to handle the shape (N, 1, 3)
             delta_dc = deltas['features_dc'].unsqueeze(1)  # (N, 1, 3)
-            gaussians._features_dc.data = gaussians._features_dc.data + alpha * delta_dc
+            modified_gaussians._features_dc.data = (1 - alpha) * base_gaussians._features_dc.data + alpha * delta_dc
             
             # Features Rest - need to reshape properly
-            if gaussians._features_rest.numel() > 0:
-                n_points = gaussians._features_rest.shape[0]
-                n_features = gaussians._features_rest.shape[1] 
-                n_coeffs = gaussians._features_rest.shape[2]
+            if base_gaussians._features_rest.numel() > 0:
+                n_points = base_gaussians._features_rest.shape[0]
+                n_features = base_gaussians._features_rest.shape[1] 
+                n_coeffs = base_gaussians._features_rest.shape[2]
                 
                 # Reshape delta to match features_rest shape
                 delta_rest = deltas['features_rest'].view(n_points, n_features, n_coeffs)
-                gaussians._features_rest.data = gaussians._features_rest.data + alpha * delta_rest
+                modified_gaussians._features_rest.data = (1 - alpha) * base_gaussians._features_rest.data + alpha * delta_rest
             
             # Scaling
-            gaussians._scaling.data = gaussians._scaling.data + alpha * deltas['scaling']
+            modified_gaussians._scaling.data = (1 - alpha) * base_gaussians._scaling.data + alpha * deltas['scaling']
             
             # Rotation
-            gaussians._rotation.data = gaussians._rotation.data + alpha * deltas['rotation']
+            modified_gaussians._rotation.data = (1 - alpha) * base_gaussians._rotation.data + alpha * deltas['rotation']
             
             # Opacity  
-            gaussians._opacity.data = gaussians._opacity.data + alpha * deltas['opacity'] 
+            modified_gaussians._opacity.data = (1 - alpha) * base_gaussians._opacity.data + alpha * deltas['opacity']
+    
+    return modified_gaussians 
