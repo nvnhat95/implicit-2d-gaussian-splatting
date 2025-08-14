@@ -422,8 +422,6 @@ class GaussianRevisionPipeline(nn.Module):
         n_batches = (n_points + batch_size - 1) // batch_size
         all_deltas = {}
         
-        print(f"Processing {n_points} points in {n_batches} batches...")
-        
         # Process in batches
         for batch_idx, start_idx in enumerate(range(0, n_points, batch_size)):
             end_idx = min(start_idx + batch_size, n_points)
@@ -450,7 +448,6 @@ class GaussianRevisionPipeline(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         
-        print("Batch processing completed.")
         return all_deltas
 
     def forward(self, gaussians, batch_size: Optional[int] = None) -> Dict[str, torch.Tensor]:
@@ -467,12 +464,9 @@ class GaussianRevisionPipeline(nn.Module):
         ndfp_points = self.ndfp_converter.convert_from_model(gaussians)
         
         # Build octree once with all points
-        print(f"Building octree from {ndfp_points.shape[0]} points...")
         octree = self.feature_extractor.build_octree(ndfp_points, self.octree_depth)
-        print("Octree built successfully.")
         
         # Extract features once for all points
-        print(f"Extracting features for {ndfp_points.shape[0]} points...")
         if self.training:
             # During training, we need gradients for MLP, but feature extraction can be no_grad
             with torch.no_grad():
@@ -502,18 +496,16 @@ class GaussianRevisionPipeline(nn.Module):
                     octree
                 )
         
-        print("Features extracted successfully.")
-        
         # Determine effective batch size
         effective_batch_size = batch_size if batch_size is not None else self.batch_size
         
         # If batch_size is None or features fit in memory, process all at once
         if effective_batch_size is None or combined_features.shape[0] <= effective_batch_size:
-            print(f"Processing {combined_features.shape[0]} points in single batch")
+            #print(f"Processing {combined_features.shape[0]} points in single batch")
             return self._forward_single_batch(combined_features)
         
         # Otherwise, process in batches
-        print(f"Processing {combined_features.shape[0]} points in batches of {effective_batch_size}")
+        #print(f"Processing {combined_features.shape[0]} points in batches of {effective_batch_size}")
         return self._forward_batched(combined_features, effective_batch_size)
 
 

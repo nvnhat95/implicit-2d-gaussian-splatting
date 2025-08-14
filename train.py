@@ -29,6 +29,25 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+def get_annealed_alpha(iteration, start_iter, start_alpha, end_alpha, annealing_iters):
+    """Calculate annealed alpha value based on current iteration.
+    
+    Args:
+        iteration: Current training iteration
+        start_iter: Iteration to start annealing
+        start_alpha: Starting alpha value
+        end_alpha: Final alpha value
+        annealing_iters: Number of iterations over which to anneal
+    
+    Returns:
+        Current alpha value
+    """
+    if iteration < start_iter:
+        return start_alpha
+    
+    progress = min((iteration - start_iter) / annealing_iters, 1.0)
+    return start_alpha + progress * (end_alpha - start_alpha)
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -40,37 +59,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.restore(model_params, opt)
 
     # Initialize Gaussian revision pipeline
-    checkpoint_path = "octformer/checkpoints/octformer_scannet200/best_model.pth"
     revision_pipeline = None
-    batch_size = 1024
+    mlp_optimizer = None
+    
+    if opt.revision:
+        checkpoint_path = "octformer/checkpoints/octformer_scannet200/best_model.pth"
+        batch_size = 1024
 
-    if os.path.exists(checkpoint_path):
-        try:
-            revision_pipeline = GaussianRevisionPipeline(
-                checkpoint_path=checkpoint_path,
-                max_sh_degree=dataset.sh_degree,
-                octree_depth=8,
-                position_encoding='both',
-                feature_depth=5,  # Use features from depth 8
-                device='cuda',
-                batch_size=batch_size,
-            )
-            
-            # Add MLP parameters to optimizer
-            mlp_params = list(revision_pipeline.mlp.parameters())
-            if mlp_params:
-                mlp_optimizer = torch.optim.Adam(mlp_params, lr=opt.feature_lr)
-                print("Initialized MLP optimizer for Gaussian revision")
-            else:
+        if os.path.exists(checkpoint_path):
+            try:
+                revision_pipeline = GaussianRevisionPipeline(
+                    checkpoint_path=checkpoint_path,
+                    max_sh_degree=dataset.sh_degree,
+                    octree_depth=8,
+                    position_encoding='both',
+                    feature_depth=5,  # Use features from depth 5
+                    device='cuda',
+                    batch_size=batch_size,
+                )
+                
+                # Add MLP parameters to optimizer
+                mlp_params = list(revision_pipeline.mlp.parameters())
+                if mlp_params:
+                    mlp_optimizer = torch.optim.Adam(mlp_params, lr=opt.feature_lr)
+                    print("Initialized MLP optimizer for Gaussian revision")
+                else:
+                    mlp_optimizer = None
+                    
+                print(f"Revision pipeline enabled with alpha annealing: {opt.revision_alpha_start} -> {opt.revision_alpha_end} over {opt.revision_alpha_annealing_iters} iterations")
+            except Exception as e:
+                print(f"Failed to initialize revision pipeline: {e}")
+                revision_pipeline = None
                 mlp_optimizer = None
-        except Exception as e:
-            print(f"Failed to initialize revision pipeline: {e}")
+        else:
+            print(f"Revision checkpoint not found: {checkpoint_path}")
             revision_pipeline = None
             mlp_optimizer = None
     else:
-        print(f"Checkpoint not found: {checkpoint_path}")
-        revision_pipeline = None
-        mlp_optimizer = None
+        print("Revision pipeline disabled")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -99,8 +125,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        
-        alpha = 0.5
 
         # Revise Gaussians using Octree
         # first we convert Gaussians to NDFP format
@@ -110,8 +134,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # then, Gaussians will be added with delta Gaussians to get the final revised Gaussians
         #    gaussians = (1 - alpha) * gaussians + alpha * delta_gaussians
         # the MLP will be learned by the loss below
-        if revision_pipeline is not None and iteration > 100:  # Start revision after some initial training
+        if revision_pipeline is not None and iteration >= opt.revision_start_iter:
             try:
+                # Calculate annealed alpha value
+                alpha = get_annealed_alpha(
+                    iteration, 
+                    opt.revision_start_iter, 
+                    opt.revision_alpha_start, 
+                    opt.revision_alpha_end, 
+                    opt.revision_alpha_annealing_iters
+                )
+                
                 # Set MLP to training mode
                 revision_pipeline.mlp.train()
                 
@@ -329,7 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)

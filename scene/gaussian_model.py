@@ -206,6 +206,17 @@ class GaussianModel:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
+    def save_pt(self, path):
+        """Save the complete model state to a PyTorch .pt file"""
+        mkdir_p(os.path.dirname(path))
+        model_state = self.capture()
+        torch.save(model_state, path)
+
+    def load_pt(self, path, training_args):
+        """Load the complete model state from a PyTorch .pt file"""
+        model_args = torch.load(path)
+        self.restore(model_args, training_args)
+
     def reset_opacity(self):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
