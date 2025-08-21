@@ -1,5 +1,6 @@
 import torch
 from typing import Optional
+from utils.sh_utils import eval_sh
 
 
 def build_rotation(q: torch.Tensor) -> torch.Tensor:
@@ -49,13 +50,20 @@ class GaussianToNDFP:
 
 	- Normal: computed from Gaussian rotation by rotating the canonical z-axis.
 	- Displacement: constant or provided tensor (default 0.0).
-	- Color: taken from DC SH coefficients using SH constant and clamping to [0,1].
+	- Color: taken from full SH coefficients using eval_sh function and clamping to [0,1].
 	- Position: Gaussian xyz.
 	"""
 
-	def __init__(self, displacement_value: float = 0.0, device: Optional[torch.device] = None):
+	def __init__(self, displacement_value: float = 0.0, device: Optional[torch.device] = None, 
+				 sh_degree: int = 3, viewing_direction: Optional[torch.Tensor] = None):
 		self.displacement_value = float(displacement_value)
 		self.device = device
+		self.sh_degree = sh_degree
+		# Default viewing direction (looking down negative z-axis)
+		if viewing_direction is None:
+			self.viewing_direction = torch.tensor([0.0, 0.0, -1.0])
+		else:
+			self.viewing_direction = viewing_direction
 
 	@staticmethod
 	def _ensure_device(t: torch.Tensor, device: Optional[torch.device]) -> torch.Tensor:
@@ -73,6 +81,28 @@ class GaussianToNDFP:
 		rgb = dc_sh * SH_C0
 		return torch.clamp(rgb, 0.0, 1.0)
 
+	def _sh_to_rgb(self, sh_features: torch.Tensor, directions: Optional[torch.Tensor] = None) -> torch.Tensor:
+		"""Convert full SH coefficients to RGB using eval_sh function.
+		Args:
+			sh_features: (N, 3, K) where K = (sh_degree + 1)^2
+			directions: (N, 3) viewing directions (optional, uses default if None)
+		Returns:
+			rgb: (N, 3) clamped to [0, 1]
+		"""
+		if directions is None:
+			# Use default viewing direction for all points
+			directions = self.viewing_direction.to(sh_features.device).unsqueeze(0).expand(sh_features.shape[0], -1)
+		
+		# Normalize directions
+		directions = directions / torch.norm(directions, dim=-1, keepdim=True)
+		
+		# Evaluate SH to get RGB
+		rgb = eval_sh(self.sh_degree, sh_features, directions)  # (N, 3)
+		
+		# Add 0.5 offset and clamp as done in the CUDA implementation
+		rgb = rgb + 0.5
+		return torch.clamp(rgb, 0.0, 1.0)
+
 	@staticmethod
 	def _rotation_to_normal(rotation_matrix: torch.Tensor) -> torch.Tensor:
 		"""Compute normals by rotating the canonical z-axis with the given rotation matrices.
@@ -83,34 +113,41 @@ class GaussianToNDFP:
 		normals = torch.matmul(rotation_matrix, canonical_z)  # (N, 3)
 		return normals
 
-	def convert_from_model(self, model) -> torch.Tensor:
+	def convert_from_model(self, model, viewing_direction: Optional[torch.Tensor] = None) -> torch.Tensor:
 		"""Convert from a GaussianModel instance to an NDFP tensor of shape (N, 10).
 		The model is expected to provide:
 		  - model.get_xyz -> (N, 3)
 		  - model.get_rotation -> (N, 4) normalized quaternion compatible with build_rotation
-		  - model._features_dc -> (N, 1, 3) DC SH per RGB channel
+		  - model.get_features -> (N, K, 3) SH features where K = (sh_degree + 1)^2
+		Args:
+			model: GaussianModel instance
+			viewing_direction: (N, 3) viewing directions for SH evaluation (optional)
 		"""
 		xyz = model.get_xyz  # (N, 3)
 		rotation_q = model.get_rotation  # (N, 4) - normalized quaternions
-		features_dc = model._features_dc  # (N, 1, 3)
+		features_sh = model.get_features  # (N, K, 3) where K = (sh_degree + 1)^2
 
 		# Ensure device consistency
 		xyz = self._ensure_device(xyz, self.device) if self.device is not None else xyz
 		rotation_q = self._ensure_device(rotation_q, xyz.device)
-		features_dc = self._ensure_device(features_dc, xyz.device)
+		features_sh = self._ensure_device(features_sh, xyz.device)
 
 		# Build rotation matrices and normals
 		rotation_matrix = build_rotation(rotation_q)  # (N, 3, 3)
 		normals = self._rotation_to_normal(rotation_matrix)  # (N, 3)
 
-		# Color from DC SH coefficients  
-		if features_dc.dim() == 3 and features_dc.shape[1] == 1:
-			dc = features_dc.squeeze(1)  # (N, 3)
-		elif features_dc.dim() == 2:
-			dc = features_dc  # Already (N, 3)
-		else:
-			raise ValueError(f"Unexpected features_dc shape: {features_dc.shape}, expected (N, 1, 3) or (N, 3)")
-		rgb = self._dc_sh_to_rgb(dc)  # (N, 3)
+		# Color from SH coefficients
+		# Convert from (N, K, 3) to (N, 3, K) for eval_sh
+		features_sh_transposed = features_sh.transpose(1, 2)  # (N, 3, K)
+		
+		# Use the active SH degree from the model if available
+		active_degree = getattr(model, 'active_sh_degree', self.sh_degree)
+		
+		# Limit the features to the active degree
+		num_coeffs = (active_degree + 1) ** 2
+		features_sh_active = features_sh_transposed[:, :, :num_coeffs]  # (N, 3, active_coeffs)
+		
+		rgb = self._sh_to_rgb(features_sh_active, viewing_direction)  # (N, 3)
 
 		# Displacement
 		displacement = torch.full((xyz.shape[0], 1), self.displacement_value, device=xyz.device, dtype=xyz.dtype)
@@ -123,18 +160,22 @@ class GaussianToNDFP:
 		self,
 		xyz: torch.Tensor,
 		rotation: torch.Tensor,
+		sh_features: Optional[torch.Tensor] = None,
 		dc_sh_features: Optional[torch.Tensor] = None,
 		rgb: Optional[torch.Tensor] = None,
 		displacement: Optional[torch.Tensor] = None,
+		viewing_direction: Optional[torch.Tensor] = None,
 	) -> torch.Tensor:
 		"""Convert directly from tensors to NDFP.
 
 		Args:
 			xyz: (N, 3)
 			rotation: (N, 4) quaternion [w, x, y, z] compatible with build_rotation, or (N, 3, 3) rotation matrices
-			dc_sh_features: (N, 3) DC SH coefficients for RGB channels; used if rgb is None
-			rgb: (N, 3) direct RGB colors in [0, 1]; overrides dc_sh_features if provided
+			sh_features: (N, 3, K) SH coefficients where K = (sh_degree + 1)^2; used if rgb is None
+			dc_sh_features: (N, 3) DC SH coefficients for RGB channels; fallback if sh_features is None and rgb is None
+			rgb: (N, 3) direct RGB colors in [0, 1]; overrides SH features if provided
 			displacement: (N, 1) per-point displacement; if None, uses constant value from init
+			viewing_direction: (N, 3) viewing directions for SH evaluation (optional)
 
 		Returns:
 			Tensor (N, 10) in NDFP format
@@ -153,10 +194,16 @@ class GaussianToNDFP:
 
 		# Color
 		if rgb is None:
-			if dc_sh_features is None:
-				raise ValueError("Either rgb or dc_sh_features must be provided")
-			dc_sh_features = self._ensure_device(dc_sh_features, xyz.device)
-			rgb = self._dc_sh_to_rgb(dc_sh_features)
+			if sh_features is not None:
+				# Use full SH features
+				sh_features = self._ensure_device(sh_features, xyz.device)
+				rgb = self._sh_to_rgb(sh_features, viewing_direction)
+			elif dc_sh_features is not None:
+				# Fallback to DC-only conversion
+				dc_sh_features = self._ensure_device(dc_sh_features, xyz.device)
+				rgb = self._dc_sh_to_rgb(dc_sh_features)
+			else:
+				raise ValueError("Either rgb, sh_features, or dc_sh_features must be provided")
 		else:
 			rgb = self._ensure_device(rgb, xyz.device)
 
