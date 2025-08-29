@@ -42,6 +42,7 @@ def get_annealed_alpha(iteration, start_iter, start_alpha, end_alpha, annealing_
     Returns:
         Current alpha value
     """
+    return 0.99
     if iteration < start_iter:
         return start_alpha
     
@@ -67,19 +68,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     if opt.revision:
         checkpoint_path = "octformer/checkpoints/octformer_scannet200/best_model.pth"
-        batch_size = 8192
+        batch_size = 2048
 
         if os.path.exists(checkpoint_path):
             try:
                 revision_pipeline = GaussianRevisionPipeline(
-                    checkpoint_path=checkpoint_path,
+                    # checkpoint_path=checkpoint_path,
                     max_sh_degree=dataset.sh_degree,
-                    octree_depth=8,
-                    position_encoding='both',
-                    feature_depth=6,  # Use features from depth 5
+                    # octree_depth=8,
+                    # position_encoding='both',
+                    # feature_depth=4,  # Use features at depth 4
+                    mlp_hidden_dims=[128, 128],
                     device='cuda',
                     batch_size=batch_size,
                 )
+                print("INITIALIZED REVISION PIPELINE")
                 
                 # Add MLP parameters to optimizer
                 mlp_params = list(revision_pipeline.mlp.parameters())
@@ -157,6 +160,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     opt.revision_alpha_end, 
                     opt.revision_alpha_annealing_iters
                 )
+                if iteration % 1000 == 0:
+                    print(f"Alpha: {alpha}")
                 
                 # Set MLP to training mode
                 revision_pipeline.mlp.train()
@@ -392,7 +397,7 @@ if __name__ == "__main__":
     
     print("Optimizing " + args.model_path)
 
-    args.test_iterations += [30000 + i for i in range(0, 10000, 100)]
+    args.test_iterations += [7000 + i for i in range(0, 40000, 100)]
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
